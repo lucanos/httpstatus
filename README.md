@@ -1,5 +1,7 @@
 # HTTP Response Test Harness
 
+Project: https://github.com/lucanos/httpstatus
+
 A lightweight, single-file PHP service for generating deliberate HTTP responses for testing monitors, clients, retry logic, redirects, rate limiting, error handling, content negotiation, sequence handling and other HTTP-aware software.
 
 The project is inspired by Aaron Powell's [httpstatus](https://github.com/aaronpowell/httpstatus) project and retains the same wonderfully simple core idea:
@@ -476,6 +478,10 @@ If exposing it publicly:
 The included implementation caps explicit delays and does not provide arbitrary header injection.
 
 ## Credits
+
+Project repository:
+
+https://github.com/lucanos/httpstatus
 
 This project was inspired by Aaron Powell's `httpstatus` project:
 

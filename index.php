@@ -5,32 +5,92 @@ declare(strict_types=1);
 /**
  * HTTP Response Test Harness
  *
- * A lightweight single-file PHP test service inspired by Aaron Powell's
- * httpstat.us project:
+ * A lightweight HTTP response simulator inspired by Aaron Powell's
+ * httpstatus project:
  *   https://github.com/aaronpowell/httpstatus
  *
- * Original project copyright and licensing remain with their respective
- * authors. This implementation is an independent PHP reimplementation with
- * additional test behaviour, dynamic headers, randomised values and Easter eggs.
+ * Project:
+ *   https://github.com/lucanos/httpstatus
  *
- * Examples:
+ * Licensed under the MIT License.
+ *
+ * Documentation:
+ *   README.md
+ *   or visit the application root in a browser.
+ *
+ * Quick examples:
+ *
  *   /200
  *   /404
- *   /420
  *   /503
+ *
+ *   /200,404,200,302
+ *   /200x5,404,500x2
+ *   /200,404,200,302?reset=1
+ *
  *   /random
  *   /random/200,404,500
- *   /random/200,200,200,429,503
- *   /random/2xx,4xx,5xx
+ *   /random/200,200,404
+ *   /random/200x4,404
+ *   /random/200x95,404x3,500x2
  *
- * Query options:
- *   ?delay=0
+ * Common options:
+ *
  *   ?delay=1500
  *   ?delay=random
  *   ?body=0
+ *   ?format=json
+ *   ?format=html
+ *   ?format=markdown
+ *   ?format=text
+ *   ?reset=1
+ *
+ * See README.md or the browser-based User's Guide for full documentation.
  */
 
 session_start();
+
+/* --------------------------------------------------------------------------
+ * Self-install Apache rewrite configuration when possible.
+ *
+ * Existing .htaccess files are never overwritten.
+ * ----------------------------------------------------------------------- */
+
+$htaccessPath = __DIR__ . '/.htaccess';
+$htaccessPresent = file_exists($htaccessPath);
+$htaccessCreated = false;
+$htaccessWritable = is_writable(__DIR__);
+
+if (!$htaccessPresent && $htaccessWritable) {
+    $defaultHtaccess = <<<'HTACCESS'
+Options -Indexes
+
+RewriteEngine On
+
+RewriteCond %{REQUEST_FILENAME} -f [OR]
+RewriteCond %{REQUEST_FILENAME} -d
+RewriteRule ^ - [L]
+
+RewriteRule ^ index.php [QSA,L]
+
+<IfModule mod_headers.c>
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set Referrer-Policy "no-referrer"
+</IfModule>
+
+<Files ".htaccess">
+    Require all denied
+</Files>
+HTACCESS;
+
+    $htaccessCreated = @file_put_contents(
+        $htaccessPath,
+        $defaultHtaccess . PHP_EOL,
+        LOCK_EX
+    ) !== false;
+
+    $htaccessPresent = file_exists($htaccessPath);
+}
 
 /* --------------------------------------------------------------------------
  * Helpers
@@ -217,26 +277,423 @@ function expandSelector(string $selector, array $statuses): array
     return [];
 }
 
-function chooseRandomStatus(?string $selector, array $statuses): int
+function parseWeightedRandomSelector(string $selector, array $statuses): array
 {
-    if ($selector === null || trim($selector) === '') {
-        $candidates = array_values(array_filter(
-            array_keys($statuses),
-            fn(int $code): bool => $code >= 200 && $code <= 599
-        ));
-
-        return randomChoice($candidates);
-    }
-
-    $candidates = [];
+    $weighted = [];
 
     foreach (explode(',', $selector) as $part) {
+        $part = strtolower(trim($part));
+
+        if ($part === '') {
+            continue;
+        }
+
+        $weight = 1;
+
+        if (preg_match('/^([1-9][0-9]{2})x([1-9][0-9]{0,4})$/', $part, $m)) {
+            $part = $m[1];
+            $weight = min((int) $m[2], 10000);
+        }
+
         foreach (expandSelector($part, $statuses) as $code) {
-            $candidates[] = $code;
+            $weighted[] = [
+                'code' => $code,
+                'weight' => $weight,
+            ];
         }
     }
 
-    return $candidates === [] ? 400 : randomChoice($candidates);
+    return $weighted;
+}
+
+function chooseWeightedRandomStatus(?string $selector, array $statuses): int
+{
+    if ($selector === null || trim($selector) === '') {
+        $weighted = [];
+
+        foreach (array_keys($statuses) as $code) {
+            if ($code >= 200 && $code <= 599) {
+                $weighted[] = ['code' => $code, 'weight' => 1];
+            }
+        }
+    } else {
+        $weighted = parseWeightedRandomSelector($selector, $statuses);
+    }
+
+    if ($weighted === []) {
+        return 400;
+    }
+
+    $total = array_sum(array_column($weighted, 'weight'));
+    $pick = randomInt(1, $total);
+
+    foreach ($weighted as $entry) {
+        $pick -= $entry['weight'];
+
+        if ($pick <= 0) {
+            return $entry['code'];
+        }
+    }
+
+    return $weighted[array_key_last($weighted)]['code'];
+}
+
+function parseSequentialSelector(string $selector): array
+{
+    $runs = [];
+    $length = 0;
+
+    foreach (explode(',', $selector) as $part) {
+        $part = strtolower(trim($part));
+
+        if ($part === '') {
+            return [];
+        }
+
+        $count = 1;
+
+        if (preg_match('/^([1-9][0-9]{2})x([1-9][0-9]{0,4})$/', $part, $m)) {
+            $code = (int) $m[1];
+            $count = min((int) $m[2], 10000);
+
+        } elseif (preg_match('/^[1-9][0-9]{2}$/', $part)) {
+            $code = (int) $part;
+
+        } else {
+            return [];
+        }
+
+        $runs[] = [
+            'code' => $code,
+            'count' => $count,
+        ];
+
+        $length += $count;
+    }
+
+    return [
+        'expression' => $selector,
+        'runs' => $runs,
+        'length' => $length,
+    ];
+}
+
+function sequenceCodeAtPosition(array $sequence, int $positionZero): int
+{
+    $remaining = $positionZero;
+
+    foreach ($sequence['runs'] as $run) {
+        if ($remaining < $run['count']) {
+            return $run['code'];
+        }
+
+        $remaining -= $run['count'];
+    }
+
+    return $sequence['runs'][array_key_last($sequence['runs'])]['code'];
+}
+
+function chooseSequentialStatus(string $selector): array
+{
+    $sequence = parseSequentialSelector($selector);
+
+    if ($sequence === []) {
+        return [
+            'code' => 400,
+            'meta' => null,
+        ];
+    }
+
+    $key = 'sequence_' . hash('sha256', $sequence['expression']);
+
+    if (isset($_GET['reset']) && $_GET['reset'] === '1') {
+        unset($_SESSION[$key]);
+    }
+
+    $index = (int) ($_SESSION[$key] ?? 0);
+    $length = $sequence['length'];
+    $positionZero = $index % $length;
+
+    $code = sequenceCodeAtPosition($sequence, $positionZero);
+    $next = sequenceCodeAtPosition(
+        $sequence,
+        ($positionZero + 1) % $length
+    );
+
+    $meta = [
+        'expression' => $sequence['expression'],
+        'position' => $positionZero + 1,
+        'length' => $length,
+        'loop' => intdiv($index, $length) + 1,
+        'request' => $index + 1,
+        'next' => $next,
+    ];
+
+    $_SESSION[$key] = $index + 1;
+
+    return [
+        'code' => $code,
+        'meta' => $meta,
+    ];
+}
+
+function parseAcceptHeader(string $header): array
+{
+    $items = [];
+
+    foreach (explode(',', $header) as $part) {
+        $part = trim($part);
+
+        if ($part === '') {
+            continue;
+        }
+
+        $pieces = array_map('trim', explode(';', $part));
+        $type = strtolower(array_shift($pieces));
+        $q = 1.0;
+
+        foreach ($pieces as $piece) {
+            if (preg_match('/^q=([0-9.]+)$/i', $piece, $m)) {
+                $q = max(0.0, min(1.0, (float) $m[1]));
+            }
+        }
+
+        $items[] = ['type' => $type, 'q' => $q];
+    }
+
+    usort($items, fn(array $a, array $b): int => $b['q'] <=> $a['q']);
+
+    return $items;
+}
+
+function negotiateFormat(): string
+{
+    if (isset($_GET['format'])) {
+        $requested = strtolower(trim((string) $_GET['format']));
+        $aliases = [
+            'html' => 'html',
+            'json' => 'json',
+            'markdown' => 'markdown',
+            'md' => 'markdown',
+            'text' => 'text',
+            'txt' => 'text',
+        ];
+
+        if (isset($aliases[$requested])) {
+            return $aliases[$requested];
+        }
+    }
+
+    $accept = $_SERVER['HTTP_ACCEPT'] ?? '*/*';
+
+    foreach (parseAcceptHeader($accept) as $item) {
+        if ($item['q'] <= 0) {
+            continue;
+        }
+
+        $type = $item['type'];
+
+        if ($type === 'text/html' || $type === 'application/xhtml+xml') {
+            return 'html';
+        }
+
+        if ($type === 'text/markdown' || $type === 'text/x-markdown') {
+            return 'markdown';
+        }
+
+        if ($type === 'application/json' || str_ends_with($type, '+json')) {
+            return 'json';
+        }
+
+        if ($type === 'text/plain') {
+            return 'text';
+        }
+
+        if ($type === '*/*') {
+            return 'json';
+        }
+    }
+
+    return 'json';
+}
+
+function formatContentType(string $format): string
+{
+    return match ($format) {
+        'html' => 'text/html; charset=utf-8',
+        'markdown' => 'text/markdown; charset=utf-8',
+        'text' => 'text/plain; charset=utf-8',
+        default => 'application/json; charset=utf-8',
+    };
+}
+
+function flattenHeaderValues(array $headers): array
+{
+    $flat = [];
+
+    foreach ($headers as $name => $values) {
+        $flat[$name] = count($values) === 1 ? $values[0] : $values;
+    }
+
+    return $flat;
+}
+
+function referenceForStatus(int $code, array $definition): array
+{
+    $classification = $definition['standard'] ?? '';
+
+    if ($code === 418) {
+        return [
+            'label' => 'RFC 2324',
+            'url' => 'https://www.rfc-editor.org/rfc/rfc2324.html',
+        ];
+    }
+
+    if (str_contains($classification, 'Cloudflare')) {
+        return [
+            'label' => 'Cloudflare docs',
+            'url' => 'https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-5xx-errors/',
+        ];
+    }
+
+    if (str_contains($classification, 'nginx')) {
+        return [
+            'label' => 'nginx source',
+            'url' => 'https://github.com/nginx/nginx/blob/master/src/http/ngx_http_request.h',
+        ];
+    }
+
+    if (str_starts_with($classification, 'IANA')) {
+        return [
+            'label' => 'IANA registry',
+            'url' => 'https://www.iana.org/assignments/http-status-codes/http-status-codes.xhtml',
+        ];
+    }
+
+    return [
+        'label' => 'Unofficial references',
+        'url' => 'https://en.wikipedia.org/wiki/List_of_HTTP_status_codes#Unofficial_codes',
+    ];
+}
+
+function renderHtmlResponse(
+    int $code,
+    array $definition,
+    array $headers,
+    int $delayMs,
+    ?array $sequenceMeta,
+    ?string $message
+): string {
+    $rows = '';
+
+    foreach ($headers as $name => $values) {
+        foreach ($values as $value) {
+            $rows .= '<tr><th>' . h($name) . '</th><td><code>' . h($value) . '</code></td></tr>';
+        }
+    }
+
+    $sequence = '';
+
+    if ($sequenceMeta !== null) {
+        $sequence = '<h2>Sequence</h2><ul>'
+            . '<li>Values: <code>' . h($sequenceMeta['expression']) . '</code></li>'
+            . '<li>Position: <code>' . $sequenceMeta['position'] . '/' . $sequenceMeta['length'] . '</code></li>'
+            . '<li>Loop: <code>' . $sequenceMeta['loop'] . '</code></li>'
+            . '<li>Request: <code>' . $sequenceMeta['request'] . '</code></li>'
+            . '<li>Next: <code>' . $sequenceMeta['next'] . '</code></li>'
+            . '</ul>';
+    }
+
+    $messageHtml = $message !== null
+        ? '<p class="message">' . nl2br(h($message)) . '</p>'
+        : '';
+
+    return '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+        . '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        . '<title>' . $code . ' ' . h($definition['reason']) . '</title>'
+        . '<style>body{max-width:900px;margin:40px auto;padding:0 20px;font-family:system-ui,sans-serif;line-height:1.5}'
+        . 'code{background:#eee;color:#111;padding:2px 5px;border-radius:4px}'
+        . 'table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:7px 9px;border-bottom:1px solid #ccc}'
+        . '.message{font-size:1.15rem;padding:14px 16px;border-left:4px solid #777;background:#f4f4f4;color:#111}</style>'
+        . '</head><body>'
+        . '<h1>' . $code . ' ' . h($definition['reason']) . '</h1>'
+        . '<p><strong>Classification:</strong> ' . h($definition['standard'] ?? '') . '</p>'
+        . $messageHtml
+        . '<p><strong>Delay:</strong> ' . $delayMs . ' ms</p>'
+        . $sequence
+        . '<h2>Response headers</h2><table>' . $rows . '</table>'
+        . '</body></html>';
+}
+
+function renderMarkdownResponse(
+    int $code,
+    array $definition,
+    array $headers,
+    int $delayMs,
+    ?array $sequenceMeta,
+    ?string $message
+): string {
+    $out = '# ' . $code . ' ' . $definition['reason'] . "\n\n";
+    $out .= '- Classification: `' . ($definition['standard'] ?? '') . "`\n";
+    $out .= '- Delay: `' . $delayMs . " ms`\n";
+
+    if ($message !== null) {
+        $out .= "\n" . $message . "\n";
+    }
+
+    if ($sequenceMeta !== null) {
+        $out .= "\n## Sequence\n\n";
+        $out .= '- Values: `' . $sequenceMeta['expression'] . "`\n";
+        $out .= '- Position: `' . $sequenceMeta['position'] . '/' . $sequenceMeta['length'] . "`\n";
+        $out .= '- Loop: `' . $sequenceMeta['loop'] . "`\n";
+        $out .= '- Request: `' . $sequenceMeta['request'] . "`\n";
+        $out .= '- Next: `' . $sequenceMeta['next'] . "`\n";
+    }
+
+    $out .= "\n## Response headers\n\n";
+
+    foreach ($headers as $name => $values) {
+        foreach ($values as $value) {
+            $out .= '- ' . $name . ': `' . str_replace('`', '\`', $value) . "`\n";
+        }
+    }
+
+    return $out;
+}
+
+function renderTextResponse(
+    int $code,
+    array $definition,
+    array $headers,
+    int $delayMs,
+    ?array $sequenceMeta,
+    ?string $message
+): string {
+    $out = $code . ' ' . $definition['reason'] . "\n";
+    $out .= 'Classification: ' . ($definition['standard'] ?? '') . "\n";
+    $out .= 'Delay: ' . $delayMs . " ms\n";
+
+    if ($message !== null) {
+        $out .= "\n" . $message . "\n";
+    }
+
+    if ($sequenceMeta !== null) {
+        $out .= "\nSequence: " . $sequenceMeta['expression'] . "\n";
+        $out .= 'Sequence-Position: ' . $sequenceMeta['position'] . '/' . $sequenceMeta['length'] . "\n";
+        $out .= 'Sequence-Loop: ' . $sequenceMeta['loop'] . "\n";
+        $out .= 'Sequence-Request: ' . $sequenceMeta['request'] . "\n";
+        $out .= 'Sequence-Next: ' . $sequenceMeta['next'] . "\n";
+    }
+
+    $out .= "\n";
+
+    foreach ($headers as $name => $values) {
+        foreach ($values as $value) {
+            $out .= $name . ': ' . $value . "\n";
+        }
+    }
+
+    return $out;
 }
 
 function h(string $value): string
@@ -1283,19 +1740,50 @@ if ($path === '') {
 
     <h2>Quick start</h2>
 
+    <h3>Fixed response</h3>
     <pre><?= h($baseUrl) ?>/200
 <?= h($baseUrl) ?>/404
-<?= h($baseUrl) ?>/420
-<?= h($baseUrl) ?>/503
+<?= h($baseUrl) ?>/503</pre>
 
-<?= h($baseUrl) ?>/random
-<?= h($baseUrl) ?>/random/200,404,500
-<?= h($baseUrl) ?>/random/200,200,200,429,503
-<?= h($baseUrl) ?>/random/2xx,4xx,5xx</pre>
+    <h3>Sequenced responses</h3>
+    <pre><?= h($baseUrl) ?>/200,404,200,302
+<?= h($baseUrl) ?>/200x5,404,500x2
+<?= h($baseUrl) ?>/200,404,200,302?reset=1</pre>
 
     <p>
-        Repeating a status in a random selector weights it. For example,
-        <code>/random/200,200,200,500</code> makes 200 three times as likely as 500.
+        Without the <code>/random/</code> prefix, a comma-separated list is a
+        deterministic sequence. Numeric multipliers repeat a status in-place, so
+        <code>/200x5,404,500x2</code> is equivalent to five 200 responses, then 404,
+        then two 500 responses. Each request advances to the next logical status and
+        the sequence repeats after the final item. Sequence state is tracked per
+        client session and per sequence definition.
+    </p>
+
+    <p>
+        <code>?reset=1</code> resets that sequence before returning the first item.
+    </p>
+
+    <h3>Random responses</h3>
+    <pre><?= h($baseUrl) ?>/random
+<?= h($baseUrl) ?>/random/200,404,500
+<?= h($baseUrl) ?>/random/2xx,4xx,5xx</pre>
+
+    <h3>Weighted random responses</h3>
+    <pre><?= h($baseUrl) ?>/random/200,200,404
+<?= h($baseUrl) ?>/random/200x2,404
+<?= h($baseUrl) ?>/random/200x4,404
+<?= h($baseUrl) ?>/random/200x95,404x3,500x2</pre>
+
+    <p>
+        Repetition and multipliers both control probability. For example,
+        <code>/random/200,200,404</code> and <code>/random/200x2,404</code>
+        are equivalent. The multiplier form is easier to read for larger
+        distributions such as <code>/random/200x95,404x3,500x2</code>.
+    </p>
+
+    <p>
+        Numeric multipliers are supported up to <code>x10000</code>.
+        Status classes such as <code>2xx</code> can be repeated for weighting.
     </p>
 
     <h2>Build a test URL</h2>
@@ -1306,6 +1794,7 @@ if ($path === '') {
             <label for="mode">Mode</label>
             <select id="mode">
                 <option value="single">Single status</option>
+                <option value="sequence">Sequenced responses</option>
                 <option value="random">Random selection</option>
             </select>
         </div>
@@ -1321,13 +1810,23 @@ if ($path === '') {
             </select>
         </div>
 
+        <div class="field third" id="sequenceField" hidden>
+            <label for="sequenceCodes">Sequence</label>
+            <input
+                id="sequenceCodes"
+                type="text"
+                value="200x5,404,500x2"
+                placeholder="200x5,404,500x2"
+            >
+        </div>
+
         <div class="field third" id="randomField" hidden>
             <label for="randomCodes">Random selector</label>
             <input
                 id="randomCodes"
                 type="text"
-                value="200,200,200,429,503"
-                placeholder="200,404,500 or 2xx,4xx,5xx"
+                value="200x95,404x3,500x2"
+                placeholder="200,404,500 or 200x95,404x3,500x2"
             >
         </div>
 
@@ -1341,6 +1840,17 @@ if ($path === '') {
                 <option value="1000">1 second</option>
                 <option value="2500">2.5 seconds</option>
                 <option value="5000">5 seconds</option>
+            </select>
+        </div>
+
+        <div class="field third">
+            <label for="format">Format</label>
+            <select id="format">
+                <option value="">Use Accept header</option>
+                <option value="html">HTML</option>
+                <option value="json">JSON</option>
+                <option value="markdown">Markdown</option>
+                <option value="text">Plain text</option>
             </select>
         </div>
 
@@ -1379,27 +1889,83 @@ if ($path === '') {
         </thead>
         <tbody>
         <tr>
-            <td><code>delay</code></td>
-            <td><code>?delay=1500</code></td>
+            <td><code>delay=0</code></td>
+            <td><code>/504?delay=0</code></td>
+            <td>Disable any status-specific simulated delay.</td>
+        </tr>
+        <tr>
+            <td><code>delay=&lt;ms&gt;</code></td>
+            <td><code>/200?delay=1500</code></td>
             <td>Force a delay in milliseconds, capped at 30 seconds.</td>
         </tr>
         <tr>
             <td><code>delay=random</code></td>
-            <td><code>?delay=random</code></td>
-            <td>Choose a random delay between 50 and 5000 ms.</td>
-        </tr>
-        <tr>
-            <td><code>delay=0</code></td>
-            <td><code>?delay=0</code></td>
-            <td>Disable even the status code's built-in simulated delay.</td>
+            <td><code>/200?delay=random</code></td>
+            <td>Random delay between 50 and 5000 ms.</td>
         </tr>
         <tr>
             <td><code>body=0</code></td>
-            <td><code>?body=0</code></td>
-            <td>Return the status and headers without the normal response body.</td>
+            <td><code>/404?body=0</code></td>
+            <td>Suppress the response body.</td>
+        </tr>
+        <tr>
+            <td><code>format=json</code></td>
+            <td><code>/429?format=json</code></td>
+            <td>Force JSON.</td>
+        </tr>
+        <tr>
+            <td><code>format=html</code></td>
+            <td><code>/429?format=html</code></td>
+            <td>Force HTML.</td>
+        </tr>
+        <tr>
+            <td><code>format=markdown</code></td>
+            <td><code>/429?format=markdown</code></td>
+            <td>Force Markdown.</td>
+        </tr>
+        <tr>
+            <td><code>format=text</code></td>
+            <td><code>/429?format=text</code></td>
+            <td>Force plain text.</td>
+        </tr>
+        <tr>
+            <td><code>reset=1</code></td>
+            <td><code>/200,404,500?reset=1</code></td>
+            <td>Reset the current client's sequence and return its first item.</td>
         </tr>
         </tbody>
     </table>
+
+    <h2>Content negotiation</h2>
+
+    <p>
+        Without a <code>?format=</code> override, the service uses the request's
+        <code>Accept</code> header and supports:
+    </p>
+
+    <pre>text/html
+application/json
+text/markdown
+text/plain</pre>
+
+    <p>
+        Normal browser navigation prefers HTML. <code>Accept: */*</code> defaults
+        to JSON. Content-negotiated responses include <code>Vary: Accept</code>.
+    </p>
+
+    <h2>Sequence diagnostics</h2>
+
+    <pre>X-Test-Sequence
+X-Test-Sequence-Position
+X-Test-Sequence-Length
+X-Test-Sequence-Loop
+X-Test-Sequence-Request
+X-Test-Sequence-Next</pre>
+
+    <p>
+        Positions and loop counters are one-based, so the first pass through a
+        sequence is loop <code>1</code>.
+    </p>
 
     <h2>What varies between requests?</h2>
 
@@ -1407,19 +1973,16 @@ if ($path === '') {
         Where appropriate, values such as <code>Retry-After</code>,
         <code>Location</code>, ETags, rate-limit metadata, request IDs,
         authentication realms, content ranges and simulated delays are generated
-        dynamically. This lets test clients read and respond to the values they
-        actually receive instead of relying on fixed fixtures.
+        dynamically. This lets test clients act on the values they actually receive.
     </p>
 
     <h2>Important limitations</h2>
 
     <p>
-        Some status codes describe behaviour that application-level PHP cannot
-        faithfully reproduce. Informational 1xx responses normally precede a final
-        response. nginx 444 normally closes a connection without sending an HTTP
-        response at all. TLS handshake failures and true network timeouts happen
-        below the PHP application layer. Those entries are still useful for testing
-        status parsing, but they are not perfect wire-level simulations.
+        This is an application-level simulator. Informational 1xx responses,
+        nginx 444 connection-closing behaviour, genuine TCP failures, TLS handshake
+        failures and true network-level timeouts cannot all be reproduced perfectly
+        from PHP behind a conventional web server.
     </p>
 
     <h2>Status catalogue</h2>
@@ -1430,15 +1993,20 @@ if ($path === '') {
             <th>Code</th>
             <th>Reason</th>
             <th>Classification</th>
+            <th>Reference</th>
         </tr>
         </thead>
         <tbody>
         <?php foreach ($statuses as $code => $definition): ?>
+            <?php $reference = referenceForStatus((int) $code, $definition); ?>
             <tr>
                 <td><a href="/<?= (int) $code ?>"><?= (int) $code ?></a></td>
                 <td><?= h($definition['reason']) ?></td>
+                <td><span class="tag"><?= h($definition['standard'] ?? '') ?></span></td>
                 <td>
-                    <span class="tag"><?= h($definition['standard'] ?? '') ?></span>
+                    <a href="<?= h($reference['url']) ?>" rel="noopener noreferrer">
+                        <?= h($reference['label']) ?>
+                    </a>
                 </td>
             </tr>
         <?php endforeach; ?>
@@ -1448,12 +2016,18 @@ if ($path === '') {
     <h2>Credits</h2>
 
     <p>
-        Concept credit:
+        Project:
+        <a href="https://github.com/lucanos/httpstatus" rel="noopener noreferrer">
+            github.com/lucanos/httpstatus
+        </a>
+    </p>
+
+    <p>
+        Inspired by
         <a href="https://github.com/aaronpowell/httpstatus" rel="noopener noreferrer">
-            Aaron Powell / httpstat.us
-        </a>.
-        The original project describes itself as a simple way to test HTTP status
-        codes by appending the desired code to the service URL.
+            Aaron Powell's httpstatus project
+        </a>,
+        which is also distributed under the MIT License.
     </p>
 
 </main>
@@ -1463,10 +2037,13 @@ if ($path === '') {
     const base = <?= json_encode($baseUrl, JSON_UNESCAPED_SLASHES) ?>;
     const mode = document.getElementById('mode');
     const statusCode = document.getElementById('statusCode');
+    const sequenceCodes = document.getElementById('sequenceCodes');
     const randomCodes = document.getElementById('randomCodes');
     const singleField = document.getElementById('singleField');
+    const sequenceField = document.getElementById('sequenceField');
     const randomField = document.getElementById('randomField');
     const delay = document.getElementById('delay');
+    const format = document.getElementById('format');
     const body = document.getElementById('body');
     const resultUrl = document.getElementById('resultUrl');
     const testButton = document.getElementById('testButton');
@@ -1478,6 +2055,9 @@ if ($path === '') {
         if (mode.value === 'random') {
             const selector = randomCodes.value.trim();
             path = selector ? '/random/' + selector : '/random';
+        } else if (mode.value === 'sequence') {
+            const selector = sequenceCodes.value.trim();
+            path = '/' + (selector || '200x5,404,500x2');
         } else {
             path = '/' + statusCode.value;
         }
@@ -1486,6 +2066,10 @@ if ($path === '') {
 
         if (delay.value !== '') {
             params.set('delay', delay.value);
+        }
+
+        if (format.value !== '') {
+            params.set('format', format.value);
         }
 
         if (body.value !== '') {
@@ -1497,13 +2081,13 @@ if ($path === '') {
     }
 
     function syncMode() {
-        const random = mode.value === 'random';
-        singleField.hidden = random;
-        randomField.hidden = !random;
+        singleField.hidden = mode.value !== 'single';
+        sequenceField.hidden = mode.value !== 'sequence';
+        randomField.hidden = mode.value !== 'random';
         buildUrl();
     }
 
-    [mode, statusCode, randomCodes, delay, body].forEach(el => {
+    [mode, statusCode, sequenceCodes, randomCodes, delay, format, body].forEach(el => {
         el.addEventListener('input', buildUrl);
         el.addEventListener('change', buildUrl);
     });
@@ -1545,13 +2129,19 @@ if ($path === '') {
  * ----------------------------------------------------------------------- */
 
 $code = null;
+$sequenceMeta = null;
 
 if ($path === 'random') {
-    $code = chooseRandomStatus(null, $statuses);
+    $code = chooseWeightedRandomStatus(null, $statuses);
 
 } elseif (str_starts_with($path, 'random/')) {
     $selector = substr($path, strlen('random/'));
-    $code = chooseRandomStatus($selector, $statuses);
+    $code = chooseWeightedRandomStatus($selector, $statuses);
+
+} elseif (preg_match('/^[1-9][0-9]{2}(?:x[1-9][0-9]{0,4})?(?:,[1-9][0-9]{2}(?:x[1-9][0-9]{0,4})?)+$/i', $path)) {
+    $sequence = chooseSequentialStatus($path);
+    $code = $sequence['code'];
+    $sequenceMeta = $sequence['meta'];
 
 } elseif (preg_match('/^[1-9][0-9]{2}$/', $path)) {
     $code = (int) $path;
@@ -1577,15 +2167,21 @@ $delayMs = resolveDelay($definition);
 $headers['X-Test-Status-Code'][] = (string) $code;
 $headers['X-Test-Request-ID'][] = randomHex(12);
 $headers['X-Test-Delay-Ms'][] = (string) $delayMs;
+$headers['Vary'][] = 'Accept';
+
+if ($sequenceMeta !== null) {
+    $headers['X-Test-Sequence'][] = $sequenceMeta['expression'];
+    $headers['X-Test-Sequence-Position'][] = (string) $sequenceMeta['position'];
+    $headers['X-Test-Sequence-Length'][] = (string) $sequenceMeta['length'];
+    $headers['X-Test-Sequence-Loop'][] = (string) $sequenceMeta['loop'];
+    $headers['X-Test-Sequence-Request'][] = (string) $sequenceMeta['request'];
+    $headers['X-Test-Sequence-Next'][] = (string) $sequenceMeta['next'];
+}
 
 if ($delayMs > 0) {
     usleep($delayMs * 1000);
 }
 
-/*
- * PHP and some SAPIs reject status codes outside 100-599 in http_response_code().
- * For those historical/non-standard examples, use the raw status line only.
- */
 $protocol = $_SERVER['SERVER_PROTOCOL'] ?? 'HTTP/1.1';
 header($protocol . ' ' . $code . ' ' . $definition['reason'], true);
 
@@ -1593,8 +2189,12 @@ if ($code >= 100 && $code <= 599) {
     http_response_code($code);
 }
 
-if (!isset($headers['Content-Type'])) {
-    $headers['Content-Type'][] = 'application/json; charset=utf-8';
+$format = negotiateFormat();
+
+if ($code !== 207 && $code !== 208) {
+    $headers['Content-Type'] = [formatContentType($format)];
+} elseif (!isset($headers['Content-Type'])) {
+    $headers['Content-Type'][] = 'application/xml; charset=utf-8';
 }
 
 emitHeaders($headers);
@@ -1608,11 +2208,9 @@ if ($bodySuppressed) {
     exit;
 }
 
-if (isset($definition['body'])) {
-    echo (string) resolveValue($definition['body']);
-    echo "\n";
-    exit;
-}
+$message = isset($definition['body'])
+    ? (string) resolveValue($definition['body'])
+    : null;
 
 if ($code === 207 || $code === 208) {
     $resourceId = randomInt(1000, 9999);
@@ -1627,10 +2225,26 @@ if ($code === 207 || $code === 208) {
     exit;
 }
 
+if ($format === 'html') {
+    echo renderHtmlResponse($code, $definition, $headers, $delayMs, $sequenceMeta, $message);
+    exit;
+}
+
+if ($format === 'markdown') {
+    echo renderMarkdownResponse($code, $definition, $headers, $delayMs, $sequenceMeta, $message);
+    exit;
+}
+
+if ($format === 'text') {
+    echo renderTextResponse($code, $definition, $headers, $delayMs, $sequenceMeta, $message);
+    exit;
+}
+
 $body = [
     'status' => $code,
     'reason' => $definition['reason'],
     'classification' => $definition['standard'] ?? null,
+    'message' => $message,
     'generatedAt' => gmdate('Y-m-d\TH:i:s\Z'),
     'delayMs' => $delayMs,
     'request' => [
@@ -1640,9 +2254,14 @@ $body = [
         'protocol' => $_SERVER['SERVER_PROTOCOL'] ?? null,
         'remoteAddress' => $_SERVER['REMOTE_ADDR'] ?? null,
         'userAgent' => $_SERVER['HTTP_USER_AGENT'] ?? null,
+        'accept' => $_SERVER['HTTP_ACCEPT'] ?? null,
     ],
-    'responseHeaders' => $headers,
+    'responseHeaders' => flattenHeaderValues($headers),
 ];
+
+if ($sequenceMeta !== null) {
+    $body['sequence'] = $sequenceMeta;
+}
 
 if (isset($definition['variants'])) {
     $body['knownVariants'] = $definition['variants'];
